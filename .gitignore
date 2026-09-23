@@ -1,0 +1,14 @@
+# Rust 构建产物
+/target/
+target/
+**/*.rs.bk
+
+# WASM 构建产物(用 ./build-wasm.sh 重新生成,不要把 42MB 二进制塞进 git)
+/web/wasm/
+/web/index.html
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store
+*.swp

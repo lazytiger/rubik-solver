@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 手机适配:禁止缩放/滚动,占满全屏 -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<!-- 这个文件本身不缓存(见部署说明),所以每次都能拿到最新的 wasm 文件名 -->
+<title>魔方求解器 — Bevy 0.19 + cubr-core</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #101014; }
+  /* 画布占满视口;touch-action:none 让触摸事件交给游戏而不是浏览器手势 */
+  #game { width: 100vw; height: 100vh; display: block; touch-action: none; outline: none; }
+  #boot {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #cfd6e6; font: 15px/1.7 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    text-align: center; padding: 24px; background: #101014; z-index: 10;
+  }
+  #boot b { display: block; font-size: 18px; margin-bottom: 8px; color: #e8ecf6; }
+  #boot small { color: #8b93a7; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="boot">
+  <div>
+    <b>魔方求解器</b>
+    正在加载 WebAssembly 模块…<br>
+    <small>首次加载约 9–40 MB(取决于服务器是否开启 gzip);<br>首次求解会在浏览器内构建两阶段表(约 1 秒)</small>
+  </div>
+</div>
+<script type="module">
+  // ⚠️ JS 胶水与 wasm 是**版本强耦合**的(函数索引表必须对应),
+  //    所以两者都要带同一个内容哈希 —— 只哈希 wasm 会导致"旧 JS + 新 wasm"而报
+  //    `__wasm_bindgen_func_elem_* is not a function`。
+  const WASM = './wasm/rubik_bevy_bg.__WASM_HASH__.wasm';
+  import init from './wasm/rubik_bevy.__WASM_HASH__.js';
+  try {
+    await init({ module_or_path: WASM });   // 显式指定哈希后的 wasm
+    document.getElementById('boot').remove();
+  } catch (e) {
+    document.getElementById('boot').innerHTML =
+      '<div><b>加载失败</b><small>' + (e && e.message ? e.message : e) + '</small></div>';
+    throw e;
+  }
+</script>
+</body>
+</html>

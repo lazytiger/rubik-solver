@@ -1,0 +1,56 @@
+[package]
+name = "rubik-bevy"
+version = "0.1.0"
+edition = "2021"
+description = "Bevy 0.19 魔方求解器：任意状态 → ≤20 步解法 → 动画还原，可暂停/单步"
+
+[dependencies]
+# 只开本项目真正用到的部分(3D 网格/材质/光照 + UI 文本 + 输入/窗口)。
+# 不开 gltf / 音频 / 动画 / gizmos / sprite 等 —— 能把 wasm 体积砍掉一大截。
+bevy = { version = "0.19", default-features = false, features = [
+    "std",
+    "bevy_winit", "bevy_window", "bevy_render", "bevy_core_pipeline", "bevy_pbr",
+    "bevy_ui", "bevy_ui_render", "bevy_text", "bevy_asset", "bevy_state", "bevy_picking",
+    "bevy_color", "bevy_image", "bevy_mesh", "bevy_shader", "bevy_light", "bevy_camera",
+    "bevy_log", "default_font", "tonemapping_luts", "multi_threaded", "zstd_rust",
+    "png",   # 截图保存需要(之前精简时漏掉,导致 save_to_disk 报 Png 不支持)
+    # 平台后端
+    "x11", "wayland", "webgl2",
+] }
+cubr-core = "0.2.0"
+# wasm32-unknown-unknown 上 std 的 Instant/SystemTime 是 unimplemented!(),
+# web-time 在浏览器里走 performance.now(),原生平台直接转发给 std
+web-time = "1"
+
+# ── CJK 分词数据(可选,靠 feature 合并打开)──
+# 注意:这条**不是** "No segmentation model for complex script" 警告的修复方式 ——
+# 该警告只在新版(Neo)分词 API 上触发,而 parley 0.9 用的是 V1 API
+# (`new_for_non_complex_scripts`,复杂文字载荷恒为空)。
+# 真正的规避方式是给中文文本设 `LineBreak::AnyCharacter`(见 src/ui.rs)。
+# 这里开 auto(含词典/LSTM 数据)只是让 ICU4X 具备完整能力,避免其它路径踩坑。
+icu_segmenter = { version = "2", features = ["auto"], default-features = false }
+
+# 开发时也开优化，否则魔方搜索会慢到不可用
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# ── WASM 适配:本地 vendor 一份 cubr-core 并打补丁 ──
+# 原因:cubr-core 内部有 4 处 std::thread::scope(PDB 生成 / 并行搜索 / 看门狗),
+# 在 wasm32-unknown-unknown 上没有线程,调用即 panic。
+# 本项目的 WASM 版改为**只用两阶段算法**(毫秒级、无需 Korf 模式数据库),
+# 于是这些线程路径在 wasm 上完全不会被走到。
+# ── WASM / 移动端浏览器 ──
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[patch.crates-io]
+cubr-core = { path = "vendor/cubr-core" }
