@@ -64,6 +64,9 @@ pub fn spawn_picker(mut commands: Commands, font: Res<crate::UiFont>) {
             // 深色遮罩:让背后的魔方/面板"虚化"下去
             BackgroundColor(Color::srgba(0.03, 0.03, 0.05, 0.93)),
             ZIndex(100),
+            // 让全屏遮罩参与 UI 命中测试，取色器打开时不把指针事件
+            // 继续交给下面的魔方和编辑器按钮。
+            Pickable::default(),
             PickerRoot,
         ))
         .with_children(|overlay| {
@@ -211,24 +214,65 @@ pub fn apply_picker(
     }
 }
 
-/// 点顶点色块 → 给正在编辑的格子涂色;「擦除此格」→ 清空;「取消」→ 关闭
+/// 点顶点色块 → 给正在编辑的格子涂色;「取消」→ 关闭
+///
+/// ⚠️ 点击穿透的**根因**与对策(2026-09 修复):
+/// 以前这里是"选完立刻 `edit.picker = None`"。但此时指针往往**还按着**,
+/// 遮罩(全屏 Pickable 层)一消失,Bevy 的 UI 命中测试就会把这次仍然按住的指针
+/// 重新算到下面的格子上 —— 同一笔输入穿透成"又选中/涂了下一个格子"。
+/// 调系统顺序解决不了:穿透发生在**下一帧**(指针仍按住),不是同一帧。
+/// 现在的做法:先置 `picker_closing`,让遮罩**留到指针抬起**再关(见 `finish_close`)。
+/// 指针按着期间遮罩一直在,底下的格子就拿不到 Pressed ⇒ 从机制上杜绝穿透。
 pub fn picker_click(
     swatches: Query<(&Interaction, &PickerSwatch), Changed<Interaction>>,
     cancel: Query<&Interaction, (Changed<Interaction>, With<PickerCancel>)>,
     mut edit: ResMut<EditState>,
 ) {
+    if edit.picker_closing {
+        return; // 已经选好,正在等指针抬起
+    }
     let Some(g) = edit.picker else { return };
     let (f, i) = crate::validate::split(g);
 
     for (interaction, sw) in swatches.iter() {
         if *interaction == Interaction::Pressed {
             edit.paint(f, i, sw.0);
-            edit.picker = None; // 选完即关
+            edit.picker_closing = true; // 不立刻关:等指针抬起(防穿透)
             edit.dirty = true;
+            // 同一帧只接受一个色块,避免多个命中状态连续改写同一格
+            break;
         }
     }
-    if cancel.iter().any(|i| *i == Interaction::Pressed) {
+    if !edit.picker_closing
+        && edit.picker.is_some()
+        && cancel.iter().any(|i| *i == Interaction::Pressed)
+    {
+        edit.picker_closing = true;
+        edit.dirty = true;
+    }
+}
+
+/// 指针(鼠标左/右/中键、任意触摸点)**全部抬起**后才真正关闭取色器。
+/// 同时负责复位:取色器被别处关掉时清掉 `picker_closing`,避免状态卡住。
+pub fn finish_close(
+    buttons: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
+    mut edit: ResMut<EditState>,
+) {
+    if edit.picker.is_none() {
+        edit.picker_closing = false;
+        return;
+    }
+    if !edit.picker_closing {
+        return;
+    }
+    let held = buttons.pressed(MouseButton::Left)
+        || buttons.pressed(MouseButton::Right)
+        || buttons.pressed(MouseButton::Middle)
+        || touches.iter().next().is_some();
+    if !held {
         edit.picker = None;
+        edit.picker_closing = false;
         edit.dirty = true;
     }
 }

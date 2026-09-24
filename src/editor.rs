@@ -98,6 +98,12 @@ pub struct EditState {
     pub placeable: Vec<usize>,
     /// 正在用六边形取色器编辑的格子(None = 未打开取色器)
     pub picker: Option<usize>,
+    /// 取色器"已选好颜色、等指针抬起再关"(见 picker.rs::finish_close)。
+    ///
+    /// 为什么不能选完立刻关:指针通常还按着,遮罩一消失,Bevy 的 UI 命中测试
+    /// 会把这次**仍然按住的指针**重新算到底下的格子上 ⇒ 同一笔输入穿透成
+    /// "又选中了下一个格子"。让遮罩活到指针抬起,底下的格子就永远拿不到 Pressed。
+    pub picker_closing: bool,
 }
 
 impl Default for EditState {
@@ -114,6 +120,7 @@ impl Default for EditState {
             error_cells: Vec::new(),
             placeable: Vec::new(),
             picker: None,
+            picker_closing: false,
         };
         // 默认盘面 = 还原态(全部已知)
         st.from_cube(&cubr_core::model::CubeState::solved());
@@ -285,7 +292,8 @@ impl EditState {
                     // 修完再试一次补全,尽量把盘面交给用户时是"可继续/已完整"的
                     let n = validate::empty_count(&self.cells);
                     if n > 0 && n <= 4 {
-                        if let Some(done) = validate::find_completion(&self.cells) {
+                        // 只有"唯一解"才替用户补全 —— 多解时补一个等于把用户的魔方换掉
+                        if let Some(done) = validate::find_unique_completion(&self.cells) {
                             self.cells = done;
                         }
                     }
@@ -299,9 +307,14 @@ impl EditState {
                 Err(e) => self.message = e,
             }
         } else if !complete && left <= 4 {
-            if let Some(done) = validate::find_completion(&self.cells) {
+            if let Some(done) = validate::find_unique_completion(&self.cells) {
                 self.cells = done;
-                self.message = format!("已自动补全最后 {left} 格(唯一合法解)");
+                self.message = format!("已自动补全最后 {left} 格(合法解唯一)");
+            } else if validate::find_completion(&self.cells).is_some() {
+                // 有解但不唯一:不替用户猜,把决定权交回去(以前这里会静默补一个,
+                // 约 23% 的会话会被补成"另一个魔方")
+                self.message =
+                    format!("还剩 {left} 格,存在多种合法补法 —— 请按你自己的魔方继续涂");
             }
         }
     }
@@ -672,6 +685,10 @@ pub fn cell_click(
     mut q: Query<(&Interaction, &FaceletCell), (Changed<Interaction>, With<Button>)>,
     mut edit: ResMut<EditState>,
 ) {
+    // 取色器是模态层；弹层打开时，底下的展开图不能再次消费同一点击。
+    if edit.picker.is_some() {
+        return;
+    }
     for (interaction, cell) in q.iter_mut() {
         if *interaction == Interaction::Pressed {
             // 新的交互:点格子弹出六边形取色器(见 ui::apply_picker)
@@ -719,6 +736,9 @@ pub fn palette_click(
     mut q: Query<(&Interaction, &PaletteSwatch, &mut BorderColor), (Changed<Interaction>, With<Button>)>,
     mut edit: ResMut<EditState>,
 ) {
+    if edit.picker.is_some() {
+        return;
+    }
     for (interaction, sw, _) in q.iter_mut() {
         if *interaction == Interaction::Pressed {
             if validate::full_colors(&edit.cells)[validate::color_idx(sw.0)] {
@@ -947,6 +967,271 @@ pub fn pulse_hints(
                 1.0
             }));
         }
+    }
+}
+
+// ─────────────── 输入回归测试:随机打乱 → 逐格输入(能否完整输入?) ───────────────
+//
+// 回答一个问题:**拿一个真实的打乱魔方,按「自定义输入」逐格输入,能不能顺利输入完?**
+//
+// 为什么必须有它:输入流程里有**自动推导**(validate::propagate)和**自动补全**
+// (validate::find_completion)。它们只要"猜"错一次,错色就会写进盘面;错色占掉颜色
+// 配额后,用户输入自己的真实颜色就会被「已放满 9 格」拒绝。这类 bug 单测某个函数
+// 测不出来,必须走完整流程(**paint → rederive → is_feasible**)才会暴露。
+//
+// 用法:
+//   cargo test -- --nocapture                          # 默认 80 次打乱
+//   RUBIK_INPUT_FUZZ=1000 cargo run                    # 无图形环境跑 1000 次
+//   RUBIK_INPUT_FUZZ=1000 RUBIK_INPUT_FUZZ_SEED=7 cargo run
+//
+// 失败时会打印**可直接复现**的 54 字符盘面,配合 `RUBIK_STATE=<字符串>` 复现。
+
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    fn new(seed: u64) -> Self {
+        FuzzRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678_9ABC_DEF0))
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n.max(1)
+    }
+}
+
+/// 盘面 → 54 字符(面序 U R F D L B,行优先,颜色字母)—— `RUBIK_STATE` 同格式
+pub fn cells_to_facelets(cells: &Cells) -> String {
+    let mut s = String::with_capacity(54);
+    for f in 0..6 {
+        for i in 0..9 {
+            s.push(match cells[f][i] {
+                Some(StickerColor::W) => 'W',
+                Some(StickerColor::Y) => 'Y',
+                Some(StickerColor::R) => 'R',
+                Some(StickerColor::O) => 'O',
+                Some(StickerColor::B) => 'B',
+                Some(StickerColor::G) => 'G',
+                None => '.',
+            });
+        }
+    }
+    s
+}
+
+/// 一次会话失败的原因
+enum SessionFail {
+    /// 自动推导/补全填出的颜色与真实魔方不一致
+    Derived(String),
+    /// 取色器把真实颜色判为"不可填"(用户视角:色块被置灰)
+    Picker(String),
+    /// paint() 直接拒绝(状态行出现「不能涂」)
+    Paint(String),
+    /// 输入结束后盘面 ≠ 真实魔方
+    Final(String),
+}
+
+/// 统计
+#[derive(Default)]
+pub struct InputFuzzStats {
+    pub trials: usize,
+    pub sessions: usize,
+    pub picker_rejected: usize,
+    pub paint_rejected: usize,
+    pub derived_mismatch: usize,
+    pub final_mismatch: usize,
+    pub bad_target: usize,
+    pub example: Option<String>,
+}
+
+impl InputFuzzStats {
+    pub fn failed(&self) -> bool {
+        self.picker_rejected > 0
+            || self.paint_rejected > 0
+            || self.derived_mismatch > 0
+            || self.final_mismatch > 0
+            || self.bad_target > 0
+    }
+}
+
+/// 模拟几种真实输入顺序
+fn fuzz_orders(rng: &mut FuzzRng) -> Vec<(&'static str, Vec<usize>)> {
+    let row: Vec<usize> = (0..54).collect();
+    let rev: Vec<usize> = (0..54).rev().collect();
+    let mut rand: Vec<usize> = (0..54).collect();
+    for i in (1..rand.len()).rev() {
+        let j = rng.below(i + 1);
+        rand.swap(i, j);
+    }
+    // 逐面输入:面的顺序随机、面内行优先 —— 最接近真人"一面一面抄"
+    let mut faces: Vec<usize> = (0..6).collect();
+    for i in (1..faces.len()).rev() {
+        let j = rng.below(i + 1);
+        faces.swap(i, j);
+    }
+    let mut by_face: Vec<usize> = Vec::with_capacity(54);
+    for f in faces {
+        for i in 0..9 {
+            by_face.push(f * 9 + i);
+        }
+    }
+    vec![("行优先", row), ("逆序", rev), ("随机", rand), ("逐面", by_face)]
+}
+
+/// 跑一次完整会话:空盘面(只留中心)→ 按 order 逐格输入 target
+fn fuzz_one_session(target: &Cells, order: &[usize]) -> Result<(), SessionFail> {
+    let mut ed = EditState::default();
+    ed.clear(); // 与 Action::CustomInput 一致:清空,只留中心块
+
+    for &g in order {
+        let (f, i) = validate::split(g);
+        let want = match target[f][i] {
+            Some(c) => c,
+            None => continue,
+        };
+        let face_ch = "URFDLB".chars().nth(f).unwrap_or('?');
+
+        // 已被自动推导/补全填上 ⇒ 必须与真实魔方一致
+        if let Some(have) = ed.cells[f][i] {
+            if have != want {
+                return Err(SessionFail::Derived(format!(
+                    "自动填的 {face_ch}{} 是 {have:?},真实是 {want:?}",
+                    i + 1
+                )));
+            }
+            continue;
+        }
+        // ① 取色器允许吗(用户看到的是色块置灰 / 点了没反应)
+        let allowed = validate::allowed_colors(&ed.cells, g);
+        if !allowed[validate::color_idx(want)] {
+            let why = validate::can_paint(&ed.cells, g, want)
+                .err()
+                .unwrap_or_else(|| "可行性判定拒绝".into());
+            return Err(SessionFail::Picker(format!(
+                "取色器不允许 {want:?} 填 {face_ch}{} —— {why}",
+                i + 1
+            )));
+        }
+        // ② 真正涂上去(走 paint → rederive → is_feasible)
+        ed.active = want;
+        ed.paint(f, i, want);
+        if ed.cells[f][i] != Some(want) {
+            return Err(SessionFail::Paint(format!(
+                "paint() 拒绝 {want:?} → {face_ch}{} —— {}",
+                i + 1,
+                ed.message
+            )));
+        }
+    }
+    // ③ 结束时盘面必须等于真实魔方
+    if ed.cells != *target {
+        return Err(SessionFail::Final(
+            "输入结束后盘面与真实魔方不一致(被自动补成了别的解?)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 主入口:随机打乱 trials 次,每次用 4 种顺序输入。返回 true = 全部通过。
+pub fn run_input_fuzz(trials: usize, seed: u64) -> bool {
+    use cubr_core::core::CubeCore;
+    use cubr_core::model::Move;
+
+    let mut rng = FuzzRng::new(seed);
+    let mut st = InputFuzzStats { trials, ..Default::default() };
+
+    for t in 0..trials {
+        // ① 随机打乱 25 步(避免连续转同一面)
+        let mut core = CubeCore::solved();
+        let mut moves: Vec<Move> = Vec::new();
+        let mut last_axis = (99, 99, 99);
+        while moves.len() < 25 {
+            let m = Move::ALL[rng.below(Move::ALL.len())];
+            let a = m.axis();
+            let cur = (a.x, a.y, a.z);
+            if cur == last_axis {
+                continue;
+            }
+            last_axis = cur;
+            moves.push(m);
+            core.apply(m);
+        }
+        let target = validate::from_cube_state(&core.to_state());
+        if validate::validate(&target).is_err() {
+            st.bad_target += 1; // 理论上不该发生
+            continue;
+        }
+
+        // ② 用 4 种顺序各输入一遍
+        for (name, order) in fuzz_orders(&mut rng) {
+            st.sessions += 1;
+            if let Err(f) = fuzz_one_session(&target, &order) {
+                let (kind, msg) = match &f {
+                    SessionFail::Derived(m) => ("自动推导错误", m.clone()),
+                    SessionFail::Picker(m) => ("取色器拒绝真实颜色", m.clone()),
+                    SessionFail::Paint(m) => ("涂色被拒", m.clone()),
+                    SessionFail::Final(m) => ("结束时盘面不符", m.clone()),
+                };
+                match f {
+                    SessionFail::Derived(_) => st.derived_mismatch += 1,
+                    SessionFail::Picker(_) => st.picker_rejected += 1,
+                    SessionFail::Paint(_) => st.paint_rejected += 1,
+                    SessionFail::Final(_) => st.final_mismatch += 1,
+                }
+                if st.example.is_none() {
+                    st.example = Some(format!(
+                        "试验 #{t} 顺序「{name}」: {kind}: {msg}\n        RUBIK_STATE={}\n        打乱 = {}",
+                        cells_to_facelets(&target),
+                        moves.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+    }
+
+    println!("== 自定义输入回归测试:随机打乱 → 逐格输入 ==");
+    println!("  打乱次数(试验)      = {}", st.trials);
+    println!("  输入会话(试验×4 顺序) = {}", st.sessions);
+    println!("  ────────────────────────────────");
+    println!("  取色器拒绝真实颜色   = {}", st.picker_rejected);
+    println!("  涂色被拒(【不能涂】)  = {}", st.paint_rejected);
+    println!("  自动推导/补全填错     = {}", st.derived_mismatch);
+    println!("  结束时盘面不符        = {}", st.final_mismatch);
+    println!("  生成的盘面本身非法    = {}", st.bad_target);
+    if let Some(e) = &st.example {
+        println!("\n  首个失败:\n        {e}");
+    }
+    let ok = !st.failed();
+    println!(
+        "\n  结论: {}",
+        if ok {
+            "✅ 全部会话都能完整输入(无拒绝/无错填)"
+        } else {
+            "❌ 存在无法完成或被误拒的输入会话"
+        }
+    );
+    ok
+}
+
+#[cfg(test)]
+mod input_fuzz_test {
+    /// 回归:随机打乱 → 逐格输入必须次次都能完成。
+    /// (2026-09 曾因 propagate 猜朝向导致 23% 会话被污染,见 validate.rs 的同名守卫)
+    #[test]
+    fn random_scramble_can_always_be_entered() {
+        let trials: usize = std::env::var("RUBIK_FUZZ_TRIALS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(80);
+        let seed: u64 = std::env::var("RUBIK_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1);
+        assert!(
+            super::run_input_fuzz(trials, seed),
+            "输入回归测试失败:有会话无法完整输入(详见上方统计)"
+        );
     }
 }
 

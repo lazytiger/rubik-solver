@@ -277,6 +277,13 @@ pub fn propagate(cells: &mut Cells, derived: &mut [[bool; 9]; 6]) -> Vec<usize> 
             if slots.iter().all(|&g| get(cells, g).is_some()) {
                 continue;
             }
+            // ⚠️ 朝向未定 ⇒ 不许推导:整块连一个已知贴纸都没有时,这个位置该"怎么拧"
+            //    还不唯一(角块有 3 种朝向)。硬填会把颜色**填错**,而错色会占掉配额,
+            //    导致用户随后输入真实颜色时被「已放满 9 格」误拒
+            //    (实测:800 个会话里 187 个会被污染,其中 83 次直接拒掉真实颜色)。
+            if slots.iter().all(|&g| get(cells, g).is_none()) {
+                continue;
+            }
             let cands: Vec<usize> = (0..8)
                 .filter(|&k| !used_c[k] && corner_consistent(cells, ci, k).is_some())
                 .collect();
@@ -326,6 +333,10 @@ pub fn propagate(cells: &mut Cells, derived: &mut [[bool; 9]; 6]) -> Vec<usize> 
         for ei in 0..12 {
             let slots = EDGE_FACELETS[ei];
             if slots.iter().all(|&g| get(cells, g).is_some()) {
+                continue;
+            }
+            // ⚠️ 同上:一个已知贴纸都没有 ⇒ 翻转方向(2 种)未定,推导会填错颜色。
+            if slots.iter().all(|&g| get(cells, g).is_none()) {
                 continue;
             }
             let cands: Vec<usize> = (0..12)
@@ -686,6 +697,56 @@ pub fn find_completion(cells: &Cells) -> Option<Cells> {
     let mut cnt = counts(cells);
     if rec(&mut cur, &empties, 0, &mut cnt) {
         Some(cur)
+    } else {
+        None
+    }
+}
+
+/// 只在**合法补全唯一**时返回它;存在多个合法解时返回 `None`。
+///
+/// 为什么需要:编辑器在剩 ≤4 格时会"自动补全",但那种局面下**多个合法解**往往
+/// 同时存在(实测约 23% 的会话)。随手补一个就等于**替用户把魔方改成了另一个状态**,
+/// 用户按自己真实的魔方继续涂时反而被拒。补全唯一才敢替用户做决定。
+pub fn find_unique_completion(cells: &Cells) -> Option<Cells> {
+    let empties: Vec<usize> = (0..54).filter(|&g| get(cells, g).is_none()).collect();
+    if empties.is_empty() {
+        return if validate(cells).is_ok() { Some(*cells) } else { None };
+    }
+    if empties.len() > 4 {
+        return None; // 只在接近填满时才穷举(6^4 = 1296 种,毫秒级)
+    }
+    let mut cur = *cells;
+    let mut cnt = counts(cells);
+    let mut found: Vec<Cells> = Vec::new();
+    fn rec(cur: &mut Cells, empties: &[usize], i: usize, counts: &mut [u8; 6], found: &mut Vec<Cells>) {
+        if found.len() > 1 {
+            return; // 已经不止一个解了,不必再找
+        }
+        if i == empties.len() {
+            if validate(cur).is_ok() {
+                found.push(*cur);
+            }
+            return;
+        }
+        let g = empties[i];
+        for c in COLOR_ORDER {
+            let ci = color_idx(c);
+            if counts[ci] >= 9 {
+                continue;
+            }
+            counts[ci] += 1;
+            set(cur, g, Some(c));
+            rec(cur, empties, i + 1, counts, found);
+            counts[ci] -= 1;
+            set(cur, g, None);
+            if found.len() > 1 {
+                return;
+            }
+        }
+    }
+    rec(&mut cur, &empties, 0, &mut cnt, &mut found);
+    if found.len() == 1 {
+        Some(found[0])
     } else {
         None
     }

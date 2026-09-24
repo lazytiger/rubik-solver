@@ -191,6 +191,19 @@ fn main() {
         std::process::exit(if ok_state && ok_anim { 0 } else { 1 });
     }
 
+    // RUBIK_INPUT_FUZZ=<次数>:无图形环境下跑「随机打乱 → 逐格输入」回归测试后退出
+    //   例:RUBIK_INPUT_FUZZ=1000 cargo run
+    //       RUBIK_INPUT_FUZZ=1000 RUBIK_INPUT_FUZZ_SEED=7 cargo run
+    if let Ok(v) = std::env::var("RUBIK_INPUT_FUZZ") {
+        let trials: usize = v.trim().parse().unwrap_or(200);
+        let seed: u64 = std::env::var("RUBIK_INPUT_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1);
+        let ok = editor::run_input_fuzz(trials, seed);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // 外部初始状态:只解析一次(命令行 --state 优先于 RUBIK_STATE)
     let initial = state_from_cli();
     if let Some(st) = &initial {
@@ -340,9 +353,21 @@ fn main() {
                 editor::pulse_hints,
                 editor::update_status,
                 picker::apply_picker,
-                picker::picker_click,
             ),
         )
+        // 取色器点击必须在所有底层点击系统之后处理；否则 Bevy 可能并行
+        // 执行系统，关闭取色器的同一指针事件会继续落到底层控件。
+        .add_systems(
+            Update,
+            picker::picker_click
+                .after(editor::cell_click)
+                .after(editor::palette_click)
+                .after(cube_pick)
+                .after(swipe_turn),
+        )
+        // 取色器等"指针抬起"才真正关闭(点击穿透的根治,见 picker::finish_close);
+        // 环境光按视角切换:垂直单面视图要亮而均匀,3/4 视角要保留立体感。
+        .add_systems(Update, (picker::finish_close, tune_ambient_for_view))
         .add_systems(Update, ui::log_editor_messages)
         .add_systems(
             Update,
@@ -958,21 +983,29 @@ fn tick_reveal(time: Res<Time>, mut r: ResMut<RevealAnim>) {
 /// 平行光跟随相机:相机转到哪一面,光就从哪个方向照过去
 /// (原来光是世界坐标固定的 ⇒ 背面的面转过来是黑的 ✗)
 fn follow_light(
+    ui_state: Res<UiState>,
     cam: Query<&Transform, (With<Camera3d>, Without<DirectionalLight>)>,
     mut key: Query<&mut Transform, (With<KeyLight>, Without<FillLight>, Without<Camera3d>)>,
     mut fill: Query<&mut Transform, (With<FillLight>, Without<KeyLight>, Without<Camera3d>)>,
 ) {
     let Ok(c) = cam.single() else { return };
-    // 用**相机自身**的右/上轴构造偏移 —— 每个面看到的光方向一致,
-    // 而且垂直单面 与 斜 45° 两种视角都能兼顾(光始终跟着视角走)。
+    // 用**相机自身**的右/上轴构造偏移 —— 每个面看到的光方向一致。
     let back = c.translation.normalize_or_zero(); // 魔方 → 相机
     let right = c.right().normalize_or_zero();
     let up = c.up().normalize_or_zero();
 
-    // 主光:相机左上方(塑造明暗);补光:相机右下方(提亮右侧/下侧,防止死黑)
-    // 桌面:左上方斜射(两盏灯配合,立体感优先)
-    // wasm:只有一盏灯 ⇒ 更靠相机轴线,保证任何朝向的可见面都有足够亮度
-    let key_dir = if cfg!(target_arch = "wasm32") {
+    // ★两种视角用**两套不同方向的光**:
+    // - 垂直单面视图(自定义输入):目的是"把贴纸颜色认准",所以光几乎沿视线正射
+    //   (headlight),整面亮度均匀 —— 没有斜射造成的半面偏暗/高光,取色更可靠;
+    // - 3/4 斜视角(默认/播放):左上方斜射 + 右下方补光,塑造立体感。
+    // wasm(WebGL2)只支持一盏平行光 ⇒ 单灯也要偏轴,保证任何朝向的可见面都不发黑。
+    let perpendicular =
+        ui_state.mode == UiMode::Input && matches!(ui_state.input_view, InputView::Perpendicular);
+
+    let key_dir = if perpendicular {
+        // 正对 + 极小偏移:留一点点方向性,避免完全平光看着"糊"
+        (back * 0.985 + up * 0.12 - right * 0.09).normalize_or_zero() * 12.0
+    } else if cfg!(target_arch = "wasm32") {
         (back * 0.94 + up * 0.24 - right * 0.20).normalize_or_zero() * 12.0
     } else {
         (back * 0.70 + up * 0.52 - right * 0.48).normalize_or_zero() * 12.0
@@ -983,12 +1016,30 @@ fn follow_light(
             *l = key_want;
         }
     }
-    let fill_dir = (back * 0.55 - up * 0.35 + right * 0.72).normalize_or_zero() * 12.0;
+
+    let fill_dir = if perpendicular {
+        // 垂直视图:补光从另一侧近轴轻补,消掉残余的方向性渐变
+        (back * 0.99 - up * 0.10 + right * 0.08).normalize_or_zero() * 12.0
+    } else {
+        (back * 0.55 - up * 0.35 + right * 0.72).normalize_or_zero() * 12.0
+    };
     let fill_want = Transform::from_translation(fill_dir).looking_at(Vec3::ZERO, Vec3::Y);
     for mut l in fill.iter_mut() {
         if l.translation.distance(fill_want.translation) > 0.01 {
             *l = fill_want;
         }
+    }
+}
+
+/// 环境光随视角调整:垂直单面视图提亮(减少方向性明暗、颜色更接近真实贴纸),
+/// 3/4 视角恢复基础值(保留立体感)。wasm 基础值本来就高,按比例提。
+fn tune_ambient_for_view(ui_state: Res<UiState>, mut amb: ResMut<GlobalAmbientLight>) {
+    let base = if cfg!(target_arch = "wasm32") { 900.0 } else { 130.0 };
+    let perpendicular =
+        ui_state.mode == UiMode::Input && matches!(ui_state.input_view, InputView::Perpendicular);
+    let want = if perpendicular { base * 1.9 } else { base };
+    if (amb.brightness - want).abs() > 0.5 {
+        amb.brightness = want;
     }
 }
 
@@ -1150,9 +1201,13 @@ fn swipe_turn(
     window: Query<&Window>,
     cam: Query<&Transform, (With<Camera3d>, Without<DirectionalLight>)>,
     mut ui_state: ResMut<UiState>,
+    edit: Res<editor::EditState>,
     mut log: ResMut<ui::LogBuffer>,
 ) {
-    if ui_state.mode != UiMode::Input || !ui_state.editing {
+    // 取色器打开时必须是模态交互，不能把按下/释放解释为切面滑动。
+    if ui_state.mode != UiMode::Input || !ui_state.editing || edit.picker.is_some() {
+        // 丢弃打开取色器前遗留的按下位置，避免关闭后下一次释放被误判为滑动。
+        *drag = None;
         return; // 非"自定义输入"状态:禁止滑动切面
     }
     // 起点:鼠标左键按下 或 触摸开始
