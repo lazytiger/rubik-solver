@@ -266,7 +266,9 @@ fn main() {
         .insert_resource(Playback::default())
         // 浏览器(WebGL2)上平行光的表现与桌面不完全一致,环境光给足兜底,避免发黑
         .insert_resource(GlobalAmbientLight {
-            brightness: if cfg!(target_arch = "wasm32") { 900.0 } else { 130.0 },
+            // 环境光是"均匀项":给太多会把贴纸颜色洗白(wasm 曾经给到 900,明显过亮)。
+            // 兜底防黑交给"光跟随相机"(见 follow_light),而不是靠堆环境光。
+            brightness: if cfg!(target_arch = "wasm32") { 380.0 } else { 80.0 },
             ..default()
         })
         .insert_resource(start_worker())
@@ -377,6 +379,8 @@ fn main() {
                 apply_demo.run_if(|| std::env::var("RUBIK_APPLY_DEMO").is_ok()),
                 clear_demo.run_if(|| std::env::var("RUBIK_EDITOR_CLEAR").is_ok()),
                 open_log_demo.run_if(|| std::env::var("RUBIK_LOG_OPEN").is_ok()),
+                // 截图文案用:强制垂直单面视图(见 force_perp_view)
+                force_perp_view.run_if(|| std::env::var("RUBIK_FORCE_PERP").is_ok()),
             ),
         )
         .add_systems(
@@ -405,6 +409,9 @@ fn setup_scene(mut commands: Commands) {
     let (yaw, dist, height) = (0.62_f32, 10.5_f32, 6.4_f32);
     commands.spawn((
         Camera3d::default(),
+        // 颜色要"所见即所得":默认的 filmic(TonyMcMapface)会压高光、削饱和度,
+        // 六个贴纸色会显得发灰发白 ⇒ 直接线性→sRGB,不做 filmic。
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
         Transform::from_xyz(yaw.sin() * dist, height, yaw.cos() * dist)
             .looking_at(Vec3::ZERO, Vec3::Y),
     ));
@@ -749,6 +756,28 @@ fn picker_demo(mut once: Local<bool>, mut edit: ResMut<editor::EditState>, mut u
     edit.picker = Some(2 * 9 + 0); // 前面的左上角(普通格)
 }
 
+/// 调试:强制切到「自定义输入 + 垂直单面视图」的相机,便于自动截图对比光照。
+/// 不进入 editing ⇒ 魔方按**模型**渲染,所以配合 `RUBIK_APPLY_DEMO=1` 就能得到
+/// "有颜色的垂直视图";配合 `RUBIK_EDITOR_CLEAR=1` 则是空盘面。
+/// 可用 `RUBIK_PERP_FACE=0..5`(U R F D L B)选面。
+/// 例:RUBIK_APPLY_DEMO=1 RUBIK_FORCE_PERP=1 RUBIK_PERP_FACE=2 \
+///     RUBIK_SHOT_AT=4 RUBIK_SHOT_PATH=/tmp/perp.png cargo run
+/// ⚠️ 只在 debug 构建生效,而且**只生效一次** —— 早期版本是每帧强推,会把手动切换
+/// 视角/「打乱」时切回 3/4 视角的动作又按回垂直视图(踩过这个坑)。
+fn force_perp_view(mut once: Local<bool>, mut ui: ResMut<UiState>) {
+    if *once || !cfg!(debug_assertions) {
+        return;
+    }
+    *once = true;
+    ui.mode = UiMode::Input;
+    ui.input_view = InputView::Perpendicular;
+    if let Ok(f) = std::env::var("RUBIK_PERP_FACE") {
+        if let Ok(f) = f.trim().parse::<usize>() {
+            ui.face = f.min(5);
+        }
+    }
+}
+
 /// 调试:启动就打开日志弹窗
 fn open_log_demo(mut once: Local<bool>, mut log: ResMut<ui::LogBuffer>) {
     if *once {
@@ -985,8 +1014,14 @@ fn tick_reveal(time: Res<Time>, mut r: ResMut<RevealAnim>) {
 fn follow_light(
     ui_state: Res<UiState>,
     cam: Query<&Transform, (With<Camera3d>, Without<DirectionalLight>)>,
-    mut key: Query<&mut Transform, (With<KeyLight>, Without<FillLight>, Without<Camera3d>)>,
-    mut fill: Query<&mut Transform, (With<FillLight>, Without<KeyLight>, Without<Camera3d>)>,
+    mut key: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<KeyLight>, Without<FillLight>, Without<Camera3d>),
+    >,
+    mut fill: Query<
+        (&mut Transform, &mut DirectionalLight),
+        (With<FillLight>, Without<KeyLight>, Without<Camera3d>),
+    >,
 ) {
     let Ok(c) = cam.single() else { return };
     // 用**相机自身**的右/上轴构造偏移 —— 每个面看到的光方向一致。
@@ -1002,42 +1037,66 @@ fn follow_light(
     let perpendicular =
         ui_state.mode == UiMode::Input && matches!(ui_state.input_view, InputView::Perpendicular);
 
-    let key_dir = if perpendicular {
-        // 正对 + 极小偏移:留一点点方向性,避免完全平光看着"糊"
-        (back * 0.985 + up * 0.12 - right * 0.09).normalize_or_zero() * 12.0
+    // ⚠️ 垂直视图**不能**用近轴直射:那样高光正对镜头 + 无边角明暗,
+    //    颜色虽然准但整面"糊成一片白/平"(实测截图确认)。改成约 25° 斜射,
+    //    同时把强度降下来(见下面的 illuminance),既保留一点立体感,又不洗白颜色。
+    let (key_dir, key_lux) = if perpendicular {
+        (
+            (back * 0.90 + up * 0.30 - right * 0.24).normalize_or_zero() * 12.0,
+            3_400.0,
+        )
     } else if cfg!(target_arch = "wasm32") {
-        (back * 0.94 + up * 0.24 - right * 0.20).normalize_or_zero() * 12.0
+        (
+            (back * 0.88 + up * 0.30 - right * 0.26).normalize_or_zero() * 12.0,
+            4_400.0,
+        )
     } else {
-        (back * 0.70 + up * 0.52 - right * 0.48).normalize_or_zero() * 12.0
+        (
+            (back * 0.70 + up * 0.52 - right * 0.48).normalize_or_zero() * 12.0,
+            5_800.0,
+        )
     };
     let key_want = Transform::from_translation(key_dir).looking_at(Vec3::ZERO, Vec3::Y);
-    for mut l in key.iter_mut() {
-        if l.translation.distance(key_want.translation) > 0.01 {
-            *l = key_want;
+    for (mut t, mut light) in key.iter_mut() {
+        if t.translation.distance(key_want.translation) > 0.01 {
+            *t = key_want;
+        }
+        // 垂直视图用较低强度:斜射 25° + 4000 以下,颜色不会被打爆
+        if (light.illuminance - key_lux).abs() > 1.0 {
+            light.illuminance = key_lux;
         }
     }
 
-    let fill_dir = if perpendicular {
-        // 垂直视图:补光从另一侧近轴轻补,消掉残余的方向性渐变
-        (back * 0.99 - up * 0.10 + right * 0.08).normalize_or_zero() * 12.0
+    let (fill_dir, fill_lux) = if perpendicular {
+        // 垂直视图:补光从右下方轻补,只负责抬暗部,不参与"洗白"
+        (
+            (back * 0.72 - up * 0.30 + right * 0.62).normalize_or_zero() * 12.0,
+            900.0,
+        )
     } else {
-        (back * 0.55 - up * 0.35 + right * 0.72).normalize_or_zero() * 12.0
+        (
+            (back * 0.55 - up * 0.35 + right * 0.72).normalize_or_zero() * 12.0,
+            2_200.0,
+        )
     };
     let fill_want = Transform::from_translation(fill_dir).looking_at(Vec3::ZERO, Vec3::Y);
-    for mut l in fill.iter_mut() {
-        if l.translation.distance(fill_want.translation) > 0.01 {
-            *l = fill_want;
+    for (mut t, mut light) in fill.iter_mut() {
+        if t.translation.distance(fill_want.translation) > 0.01 {
+            *t = fill_want;
+        }
+        if (light.illuminance - fill_lux).abs() > 1.0 {
+            light.illuminance = fill_lux;
         }
     }
 }
 
-/// 环境光随视角调整:垂直单面视图提亮(减少方向性明暗、颜色更接近真实贴纸),
-/// 3/4 视角恢复基础值(保留立体感)。wasm 基础值本来就高,按比例提。
+/// 环境光随视角微调:垂直单面视图**略微压低**(环境光是均匀项,给多了会把贴纸
+/// 颜色洗成"粉白");3/4 视角用基础值。基础值必须与 setup 里插入的一致。
 fn tune_ambient_for_view(ui_state: Res<UiState>, mut amb: ResMut<GlobalAmbientLight>) {
-    let base = if cfg!(target_arch = "wasm32") { 900.0 } else { 130.0 };
+    let base = if cfg!(target_arch = "wasm32") { 380.0 } else { 80.0 };
     let perpendicular =
         ui_state.mode == UiMode::Input && matches!(ui_state.input_view, InputView::Perpendicular);
-    let want = if perpendicular { base * 1.9 } else { base };
+    let want = if perpendicular { base * 0.85 } else { base };
     if (amb.brightness - want).abs() > 0.5 {
         amb.brightness = want;
     }

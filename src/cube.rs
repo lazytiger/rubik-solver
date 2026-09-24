@@ -233,7 +233,10 @@ pub fn spawn_cube_entities(
             c,
             materials.add(StandardMaterial {
                 base_color: sticker_color(c),
-                perceptual_roughness: 0.35,
+                // ⚠️ 贴纸要"哑光":以前 0.35 ≈ 半亮面,一旦光接近视线方向,
+                //    高光正好反射回镜头 ⇒ 整个面泛起白 sheen、颜色发白(实测反馈)。
+                //    0.80 ≈ 塑料贴纸的哑光质感,既没有高光斑,又保留一点方向性明暗。
+                perceptual_roughness: 0.80,
                 metallic: 0.0,
                 ..default()
             }),
